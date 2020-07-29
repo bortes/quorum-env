@@ -1,0 +1,346 @@
+version: '3.6'
+
+services:
+
+  pre-init:
+    entrypoint: 
+      - /bin/sh
+      - -c
+      - |
+        rm -rf /root/.quorum/transaction-manager/*
+    image: busybox
+    volumes:
+      - ./transaction-manager:/root/.quorum/transaction-manager
+
+  ethstats:
+    depends_on:
+      - pre-init
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # caminho para a configuracao no servico
+        config_path=/eth-netstats/lib/utils/config.js
+
+        # gera a configuracao do servico
+        echo module.exports = '{ trusted: [], banned: [], reserved: [] };' > $$config_path
+
+        # define o comando
+        set -- npm start
+
+        # executa o comando
+        exec "$$@"
+    environment:
+      WS_SECRET: eth-stats-api-key
+      PORT: 8000
+    image: puppeth/ethstats
+    ports:
+      - 8000:8000
+
+  tx-manager:
+    depends_on:
+      - pre-init
+    entrypoint: 
+      - /bin/sh
+      - -c
+      - |
+        # identificador do container
+        container_id=$$(getent ahosts $$TX_MANAGER_HOST | grep STREAM | wc -l)
+
+        # caminho para o repositorio de dados do no
+        data_path=/root/.constellation
+
+        # define o ip do container
+        host_ip=$$(hostname -i)
+
+        #
+        # TRANSACTION MANAGER KEYS
+        #
+
+        # gera a chave privada do no
+        echo | constellation-node --workdir=$$data_path --generatekeys=prv
+
+        # ajusta o nome da chave publica do no
+        mv $$data_path/prv.pub $$data_path/pub.key
+
+        # caminho para a chave privada do no
+        node_prv_key_path=$$data_path/prv.key
+
+        # caminho para a chave publica do no
+        node_pub_key_path=$$data_path/pub.key
+
+        #
+        # TRANSACTION MANAGER
+        #
+
+        # caminho para o socket IPC
+        socket_path=/root/.quorum/transaction-manager/tm-$$container_id.ipc
+
+        # define o ip do no utilizado para conectar-se aos demais nos
+        othernode_node_ip=$$(getent ahosts $$TX_MANAGER_HOST | grep STREAM | tail -n 1 | awk '{print $$1}')
+
+        # configura no da rede
+        set -- constellation-node
+
+        # define o diretorio para armazenamento dos dados do no
+        set -- "$$@" --workdir=$$data_path
+
+        # define o ip e a porta especificadas no enode do no
+        set -- "$$@" --url=$$TX_MANAGER_PROTOCOL://$$host_ip:$$TX_MANAGER_PORT/ --port=$$TX_MANAGER_PORT
+
+        # define a lista de outros nos utilizados paras conectar-se aos demais nos
+        set -- "$$@" --othernodes=$$TX_MANAGER_PROTOCOL://$$othernode_node_ip:$$TX_MANAGER_PORT/
+
+        # define a chave privada utilizada pelo no
+        set -- "$$@" --privatekeys=$$node_prv_key_path
+
+        # define a chave publica utilizada pelo no
+        set -- "$$@" --publickeys=$$node_pub_key_path
+
+        # define o sokect utilizado pelo no
+        set -- "$$@" --socket=$$socket_path
+
+        # exibe comando utilizado para executar o no da rede
+        echo "$$@"
+
+        # executa no da rede
+        exec "$$@"
+    image: quorumengineering/constellation
+    environment:
+      TX_MANAGER_HOST: tx-manager
+      TX_MANAGER_PORT: 9001
+      TX_MANAGER_PROTOCOL: https
+    volumes:
+      - ./transaction-manager:/root/.quorum/transaction-manager
+
+  node:
+    depends_on:
+      - pre-init
+    entrypoint: 
+      - /bin/sh
+      - -c
+      - |
+        # identificador do container
+        container_id=$$(getent ahosts $$NODE_HOST | grep STREAM | wc -l)
+
+        # caminho para o repositorio de dados do no
+        data_path=/root/.ethereum
+
+        # define o ip do container
+        host_ip=$$(hostname -i)
+
+        #
+        # TRANSACTION MANAGER SOCKET
+        #
+
+        # caminho para o socket IPC
+        tx_manager_socket=/root/.quorum/transaction-manager/tm-$$container_id.ipc
+
+        # itera por 12x para tentar encontrar o socket IPC utilizado pelo gerenciador de transacoes
+        for counter in $$(seq 1 12)
+        do
+          # consiste socket valido
+          if [ -S $$tx_manager_socket ] 2> /dev/null
+          then
+            # termina iteracao
+            break
+          fi
+
+          # aguarda 5s para repetir o processo
+          sleep 5
+        done
+
+        # consiste socket IPC utilizado pelo gerenciador de transacoes
+        if [ ! -S $$tx_manager_socket  ]
+        then
+          echo Transaction manager IPC socket not found
+          exit 1
+        fi
+
+        #
+        # NODE ACCOUNT
+        #
+
+        # caminho para a senha da conta base do no
+        password_path=$$(mktemp)
+
+        # define a senha da conta base
+        echo $$NODE_COINBASE_PASSWORD > $$password_path
+
+        # gera uma conta base para o no
+        address=$$(geth --datadir $$data_path account new --password $$password_path)
+
+        # extrai o endereco da conta base do no
+        address=0x$$(ls $$data_path/keystore | tail -n 1 | cut -d'-' -f9) && echo Node address $$address
+
+        #
+        # GENESIS BLOCK
+        #
+
+        # caminho para o bloco genesis
+        genesis_path=/root/.ethereum/node/genesis.json
+
+        # inicializa bloco genesis
+        geth init $$genesis_path --datadir $$data_path
+
+        #
+        # STATIC NODES
+        #
+
+        # caminho para a chave privada do no estatico
+        static_node_prv_key=/root/.ethereum/node/prv.key
+
+        # chave publica do no estatico
+        static_node_pub_key=$$(bootnode -nodekey $$static_node_prv_key -writeaddress)
+
+        # caminho para a lista de nos estaticos que compoem a rede privada
+        static_node_path=$$data_path/static-nodes.json
+
+        # ip do no estatico
+        static_node_ip=$$(getent ahosts $$NODE_HOST | grep STREAM | tail -n 1 | awk '{print $$1}')
+        
+        # endereco do no estatico
+        static_node_enode=enode://$$static_node_pub_key@$$static_node_ip:$$NODE_P2P_PORT?raftport=$$NODE_RAFT_PORT
+
+        # exibe endereco do no estatico
+        echo [\"$$static_node_enode\"] > $$static_node_path
+
+        #
+        # PERMISSIONED NODES
+        #
+
+        # caminho para a lista de nos que compoem a rede permissionada
+        permissioned_nodes_path=$$data_path/permissioned-nodes.json
+
+        # define a lista de nos que fazem parte da rede permissionada
+        cp $$static_node_path $$permissioned_nodes_path
+
+        #
+        # NODE KEYS
+        #
+
+        # consiste no estatico sendo configurado
+        if [[ "$$static_node_ip" = "$$host_ip" ]]
+        then
+          # caminho para a chave privada do no
+          node_prv_key_path=$$static_node_prv_key
+        else
+          # caminho para a chave privada do no
+          node_prv_key_path=$$data_path/prv.key
+
+          # gera a chave privada do no
+          bootnode -genkey=$$node_prv_key_path
+
+          # chave publica do no
+          node_pub_key=$$(bootnode -nodekey $$node_prv_key_path -writeaddress)
+
+          # endereco do no
+          node_enode=enode://$$node_pub_key@$$host_ip:$$NODE_P2P_PORT?raftport=$$NODE_RAFT_PORT
+
+          # itera por 12x para tentar conectar-se a no estatico via RPC afim de obter o RAFT ID do novo no
+          for counter in $$(seq 1 12)
+          do
+            # define o identificador do no na rede privada com consenso RAFT
+            raft_id=$$(geth attach http://$$static_node_ip:$$NODE_RPC_PORT --exec "raft.addPeer('$$node_enode')")
+
+            # consiste identificador valido
+            if [ "$$raft_id" -eq "$$raft_id" ] 2> /dev/null
+            then
+              # termina iteracao
+              break
+            fi
+
+            # (re)define o identificador
+            raft_id=
+
+            # aguarda 5s para repetir o processo
+            sleep 5
+          done
+
+          # consiste identificador do no na rede privada com consenso RAFT nao definido
+          if [ -z "$$raft_id" ]
+          then
+            echo Could not register on RAFT network
+            exit 1
+          fi
+        fi
+
+        #
+        # NODE
+        #
+
+        # define o identificador da rede privada
+        network_id=$$(cat $$genesis_path | grep chainId | awk '{print $$2}' | tr ',' ' ')
+
+        # define um rotulo utilizado para identificador o no da rede
+        node_label=$$host_ip-$${address:2:4}-$${address:38:4}
+
+        # define o socket utilizado para acesso ao gerenciador de transacoes
+        export PRIVATE_CONFIG=$$tx_manager_socket
+
+        # configura no da rede
+        set -- geth
+
+        # define o diretorio para armazenamento dos dados do no
+        set -- "$$@" --datadir $$data_path
+
+        # define um identificador para o no
+        set -- "$$@" --identity "$$node_label" 
+
+        # define o servico de estatistcas do no
+        set -- "$$@" --ethstats $$node_label:$$ETHSTATS_SECRET@$$ETHSTATS_HOST:$$ETHSTATS_PORT
+        
+        # define a chave privada utilizada pelo no
+        set -- "$$@" --nodekey $$node_prv_key_path
+
+        # define o identificador da rede
+        set -- "$$@" --networkid $$network_id
+
+        # define o ip e a porta especificadas no enode do no
+        set -- "$$@" --nat=extip:$$host_ip --port $$NODE_P2P_PORT
+
+        # define que durante a sincronizacao da rede o no espera receber o cabecalho e os dados dos blocos assim como toda a validacao destes
+        set -- "$$@" --syncmode full
+
+        # define as apis e o acesso via http-rpc 
+        set -- "$$@" --rpc --rpcapi admin,db,eth,miner,net,txpool,personal,web3,raft --rpcaddr 0.0.0.0 --rpcport $$NODE_RPC_PORT
+
+        # define as apis e o acesso via ws-rpc 
+        set -- "$$@" --ws --wsapi eth,web3 --wsaddr 0.0.0.0 --wsport $$NODE_WS_PORT
+
+        # define os hostname pelos quais o no aceitara solicitacoes
+        set -- "$$@" --rpcvhosts="*" --rpccorsdomain="*" --wsorigins="*"
+
+        # define o preco minimo do gas
+        set -- "$$@" --gasprice 1
+
+        # define o consenso como sendo o RAFT e tambem habilita a emissao de pontos de verificacao e especifica a porta de comunicacao utilizada pelo consenso
+        set -- "$$@" --raft --emitcheckpoints --raftport $$NODE_RAFT_PORT
+
+        # consiste identificador definido
+        if [ ! -z "$$raft_id" ]
+        then
+          # define o identificador do no na rede privada com consenso RAFT
+          set -- "$$@" --raftjoinexisting $$raft_id
+        fi
+        
+        # exibe comando utilizado para executar o no da rede
+        echo "$$@"
+
+        # executa no da rede
+        exec "$$@"
+    environment:
+      ETHSTATS_HOST: ethstats
+      ETHSTATS_PORT: 8000
+      ETHSTATS_SECRET: eth-stats-api-key
+      NODE_COINBASE_PASSWORD:
+      NODE_HOST: node
+      NODE_P2P_PORT: 30303
+      NODE_RAFT_PORT: 50400
+      NODE_RPC_PORT: 8545
+      NODE_WS_PORT: 8546
+    image: quorumengineering/quorum
+    volumes:
+      - ./node/genesis.json:/root/.ethereum/node/genesis.json:ro
+      - ./node/prv.key:/root/.ethereum/node/prv.key:ro
+      - ./transaction-manager:/root/.quorum/transaction-manager
